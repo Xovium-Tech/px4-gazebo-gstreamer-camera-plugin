@@ -1,0 +1,22 @@
+# CMake
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# Compiled files
+*.so
+*.o
+*.a
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Misc
+.DS_Store

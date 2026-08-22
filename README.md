@@ -2,22 +2,41 @@
 
 GStreamer camera streaming for PX4 SITL with Gazebo Harmonic.
 
-The plugin reads frames directly from Gazebo's rendering camera and sends them as RTP/H.264 over UDP. By bypassing the `gz.msgs.Image` and Gazebo Transport path used by the default PX4 Harmonic GStreamer plugin, it reduces unnecessary frame handling and copying, resulting in lower CPU overhead and better streaming performance.
+The plugin reads frames directly from Gazebo's rendering camera and sends them as RTP/H.264 over UDP. By bypassing the `gz.msgs.Image` and Gazebo Transport path used by the default PX4 Harmonic GStreamer plugin, it avoids unnecessary frame handling and copying, reducing overhead in the camera-to-stream path and improving streaming performance.
 
-Unlike the default PX4 GStreamer plugin, which is effectively limited to a single camera stream per plugin instance, `GstPlaneCameraSystem` can stream multiple cameras at the same time. Several cameras can be mounted on the same aircraft, with each camera using its own UDP port, frame rate, bitrate, and encoder settings.
+Unlike the default PX4 Harmonic GStreamer plugin, which initializes a single camera stream per plugin instance, `GstPlaneCameraSystem` can stream multiple cameras at the same time. Several cameras can be mounted on the same aircraft, with independent UDP ports, frame rates, bitrates, and encoder settings.
 
 Features:
 
 * multiple cameras on the same aircraft
 * independent stream settings and UDP ports for each camera
 * direct access to Gazebo rendering cameras
-* lower CPU overhead compared with the Gazebo Transport image path
+* reduced overhead compared with the Gazebo Transport image path
 * x264 software encoding
 * optional NVIDIA `nvh264enc`
 * dynamic camera discovery and cleanup
 * automatic pipeline restart after GStreamer errors
 
 Tested with PX4 v1.16 and Gazebo Harmonic.
+
+## Multiple camera streams
+
+`GstPlaneCameraSystem` can stream multiple cameras from the same aircraft simultaneously. Each camera has its own UDP port and streaming configuration.
+
+For example:
+
+```
+camera_down  -> UDP 5604
+camera_front -> UDP 5606
+```
+
+<p align="center">
+  <img src="images/two-camera-streams.png" width="1000" alt="Two simultaneous camera streams in PX4 Gazebo">
+</p>
+
+<p align="center">
+  <em>Two camera streams running simultaneously from the same <code>rc_cessna</code> aircraft: one forward-facing and one downward-facing.</em>
+</p>
 
 ## Requirements
 
@@ -160,16 +179,27 @@ The camera image format must be `R8G8B8`.
 
 See `examples/model.sdf` for a complete model example.
 
-## Multiple cameras
+For additional cameras, add another camera sensor with a different name and UDP port.
 
-Each camera needs its own sensor name and UDP port. For example:
+For example:
 
 ```
-camera_down  -> UDP 5604
-camera_front -> UDP 5606
+<sensor name="camera_down" type="camera">
+  ...
+  <plugin filename="libGstPlaneCameraSystem.so"
+          name="custom::GstPlaneCameraSystem">
+    <camera_name>camera_down</camera_name>
+    <udp_host>127.0.0.1</udp_host>
+    <udp_port>5604</udp_port>
+    <rate>30</rate>
+    <bitrate_kbps>16384</bitrate_kbps>
+    <use_cuda>false</use_cuda>
+    <x264_speed_preset>1</x264_speed_preset>
+  </plugin>
+</sensor>
 ```
 
-Do not send two streams to the same UDP port.
+Each stream should use its own UDP port.
 
 ## Start PX4
 
@@ -203,17 +233,35 @@ gst-launch-1.0 -v \
   ! autovideosink sync=false
 ```
 
-For the second camera, use its port instead.
+To view another camera, run the same pipeline with its UDP port.
+
+For example, for `camera_down` on port `5604`:
+
+```
+gst-launch-1.0 -v \
+  udpsrc port=5604 caps="application/x-rtp,media=video,encoding-name=H264,payload=96" \
+  ! rtph264depay \
+  ! h264parse \
+  ! avdec_h264 \
+  ! videoconvert \
+  ! autovideosink sync=false
+```
 
 ## Streaming to another computer
 
-Set `udp_host` to the receiver's IP:
+For local streaming:
+
+```
+<udp_host>127.0.0.1</udp_host>
+```
+
+To send the stream to another computer, set `udp_host` to the receiver's IP:
 
 ```
 <udp_host>192.168.1.100</udp_host>
 ```
 
-You can also omit `udp_host` from the camera configuration and use:
+You can also omit `udp_host` from the camera configuration and set:
 
 ```
 export PX4_VIDEO_HOST_IP=192.168.1.100
@@ -221,15 +269,15 @@ export PX4_VIDEO_HOST_IP=192.168.1.100
 
 ## Configuration
 
-| Parameter | Default | Description |
-|---|---:|---|
-| `camera_name` | sensor name | Gazebo rendering camera |
-| `udp_host` | `127.0.0.1` | destination IP |
-| `udp_port` | `5600` | destination UDP port |
-| `rate` | sensor rate or `30` | stream FPS |
-| `bitrate_kbps` | `16384` | H.264 bitrate |
-| `use_cuda` | `false` | use NVIDIA `nvh264enc` when available |
-| `x264_speed_preset` | `1` | x264 speed preset |
+| Parameter           |             Default | Description                           |
+| ------------------- | ------------------: | ------------------------------------- |
+| `camera_name`       |         sensor name | Gazebo rendering camera               |
+| `udp_host`          |         `127.0.0.1` | destination IP                        |
+| `udp_port`          |              `5600` | destination UDP port                  |
+| `rate`              | sensor rate or `30` | stream FPS                            |
+| `bitrate_kbps`      |             `16384` | H.264 bitrate                         |
+| `use_cuda`          |             `false` | use NVIDIA `nvh264enc` when available |
+| `x264_speed_preset` |                 `1` | x264 speed preset                     |
 
 `udp_port` is limited to `1..65535`, `rate` to `1..240`, `bitrate_kbps` to `64..200000`, and `x264_speed_preset` to `1..10`.
 
@@ -241,7 +289,7 @@ Set:
 <use_cuda>true</use_cuda>
 ```
 
-The plugin will try `nvh264enc`. If it is unavailable or fails to start, it falls back to x264.
+The plugin will try to use `nvh264enc`. If it is unavailable or fails to start, it falls back to x264.
 
 If an active GStreamer pipeline reports a fatal error or EOS, the stream is stopped and retried after a short delay. If NVENC fails at runtime, that camera falls back to x264 for the rest of the plugin instance.
 
@@ -249,7 +297,7 @@ If an active GStreamer pipeline reports a fatal error or EOS, the stream is stop
 
 ## How it works
 
-The default PX4 Harmonic path is roughly:
+The default PX4 Harmonic GStreamer path is roughly:
 
 ```
 Gazebo Camera
@@ -264,7 +312,7 @@ Gazebo Transport
 GStreamer
 ```
 
-This plugin uses:
+`GstPlaneCameraSystem` uses:
 
 ```
 Gazebo Rendering Camera
@@ -282,9 +330,11 @@ H.264 encoder
 RTP / UDP
 ```
 
-The plugin is loaded once at world level. It discovers camera sensors containing a `GstPlaneCameraSystem` block and creates one GStreamer pipeline per camera.
+This removes the Gazebo Transport image-message subscription from the video path.
 
-Removed cameras are cleaned up automatically and can be discovered again after respawning.
+The plugin is loaded once at world level. It discovers camera sensors containing a `GstPlaneCameraSystem` block and creates a separate GStreamer pipeline for each camera.
+
+Camera streams are discovered dynamically. When a camera or aircraft is removed from the simulation, its pipeline is stopped and its stream state is cleaned up. Respawned cameras can then be discovered again.
 
 ## Install locally
 
@@ -300,6 +350,8 @@ Then add:
 export GZ_SIM_SYSTEM_PLUGIN_PATH="$HOME/.local/lib:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"
 ```
 
+You can add this line to your shell configuration if you want the plugin path to persist between terminals.
+
 ## License
 
 BSD 3-Clause.
@@ -311,3 +363,4 @@ Original PX4 implementation: Copyright (c) 2025 PX4 Development Team.
 Modifications in this repository: Copyright (c) 2026 Alex Chazov.
 
 See `LICENSE`.
+

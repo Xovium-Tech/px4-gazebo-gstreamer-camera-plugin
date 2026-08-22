@@ -2,16 +2,20 @@
 
 GStreamer camera streaming for PX4 SITL with Gazebo Harmonic.
 
-The plugin reads frames directly from Gazebo's rendering camera and sends them as RTP/H.264 over UDP. Unlike the default PX4 Harmonic GStreamer plugin, it does not subscribe to `gz.msgs.Image`, which avoids the extra Gazebo Transport image path.
+The plugin reads frames directly from Gazebo's rendering camera and sends them as RTP/H.264 over UDP. By bypassing the `gz.msgs.Image` and Gazebo Transport path used by the default PX4 Harmonic GStreamer plugin, it reduces unnecessary frame handling and copying, resulting in lower CPU overhead and better streaming performance.
+
+Unlike the default PX4 GStreamer plugin, which is effectively limited to a single camera stream per plugin instance, `GstPlaneCameraSystem` can stream multiple cameras at the same time. Several cameras can be mounted on the same aircraft, with each camera using its own UDP port, frame rate, bitrate, and encoder settings.
 
 Features:
 
-- multiple camera streams
-- independent UDP ports
-- x264 software encoding
-- optional NVIDIA `nvh264enc`
-- dynamic camera discovery and cleanup
-- automatic pipeline restart after GStreamer errors
+* multiple cameras on the same aircraft
+* independent stream settings and UDP ports for each camera
+* direct access to Gazebo rendering cameras
+* lower CPU overhead compared with the Gazebo Transport image path
+* x264 software encoding
+* optional NVIDIA `nvh264enc`
+* dynamic camera discovery and cleanup
+* automatic pipeline restart after GStreamer errors
 
 Tested with PX4 v1.16 and Gazebo Harmonic.
 

@@ -6,7 +6,6 @@ include(GNUInstallDirs)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 
-# GStreamer appsrc is used to feed raw Gazebo camera frames into the encoder.
 pkg_check_modules(
     GSTREAMER
     REQUIRED
@@ -15,9 +14,6 @@ pkg_check_modules(
     gstreamer-app-1.0
 )
 
-# When this repository is built standalone, resolve the Gazebo Harmonic
-# dependencies here. If the folder is copied under PX4's gz_plugins tree,
-# reuse PX4's already-selected Gazebo targets where possible.
 if(DEFINED GZ_SIM_TARGET AND TARGET "${GZ_SIM_TARGET}")
     set(GST_PLANE_GZ_SIM_TARGET "${GZ_SIM_TARGET}")
 else()
@@ -54,7 +50,6 @@ target_link_libraries(${PROJECT_NAME}
         Threads::Threads
 )
 
-# The resulting file is libGstPlaneCameraSystem.so.
 set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME GstPlaneCameraSystem
     POSITION_INDEPENDENT_CODE ON

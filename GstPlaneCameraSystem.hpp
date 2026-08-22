@@ -33,10 +33,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -83,11 +85,9 @@ private:
 		int x264SpeedPreset{1};
 		bool useCuda{false};
 
-		// Normal frame processing touches rendering members only on Gazebo's render thread.
 		gz::rendering::CameraPtr camera;
 		gz::rendering::Image image;
 
-		// GStreamer state is shared by the simulation and rendering threads.
 		std::mutex gstMutex;
 		GstElement *pipeline{nullptr};
 		GstElement *source{nullptr};
@@ -96,21 +96,30 @@ private:
 		unsigned int height{0};
 		std::atomic<uint64_t> frameIndex{0};
 		bool usingNvenc{false};
+		bool usingGpuConvert{false};
+		bool gpuConvertFailed{false};
 		bool nvencFailed{false};
 		std::chrono::steady_clock::time_point nextPipelineRetry{};
 
-		// Scheduling is owned by PostUpdate; frameRequested bridges to rendering.
+		std::mutex frameMutex;
+		std::condition_variable frameCv;
+		std::vector<uint8_t> pendingFrame;
+		unsigned int pendingWidth{0};
+		unsigned int pendingHeight{0};
+		bool frameReady{false};
+		bool frameWorkerStop{false};
+		std::thread frameWorker;
+		std::atomic<uint64_t> droppedFrames{0};
+
 		std::chrono::steady_clock::duration nextFrameTime{};
 		std::chrono::steady_clock::duration lastSimTime{};
 		bool scheduleInitialized{false};
 		std::atomic<bool> frameRequested{false};
 		std::atomic<bool> removed{false};
 
-		// One-shot diagnostics; rendering-thread only.
 		bool formatWarningReported{false};
 		bool renderCallReported{false};
 		bool cameraMissingReported{false};
-		bool frameCopyReported{false};
 		bool rawFrameReported{false};
 	};
 
@@ -130,6 +139,10 @@ private:
 	bool FindExistingCamera(StreamState &_stream);
 	void RenderCamera(StreamState &_stream);
 
+	void StartFrameWorker(const StreamPtr &_stream);
+	void StopFrameWorker(StreamState &_stream);
+	void FrameWorker(const StreamPtr &_stream);
+
 	void OnNewFrame(StreamState &_stream,
 			const void *_image,
 			unsigned int _width,
@@ -143,7 +156,8 @@ private:
 	bool BuildPipelineLocked(StreamState &_stream,
 				 unsigned int _width,
 				 unsigned int _height,
-				 bool _useNvenc);
+				 bool _useNvenc,
+				 bool _gpuConvert);
 	void StopPipeline(StreamState &_stream);
 	void StopPipelineLocked(StreamState &_stream);
 	void HandlePipelineFailure(StreamState &_stream, bool _disableNvenc);
@@ -153,6 +167,15 @@ private:
 	static void SetUintIfPresent(GstElement *_element,
 				     const char *_property,
 				     guint _value);
+	static void SetIntIfPresent(GstElement *_element,
+				    const char *_property,
+				    gint _value);
+	static void SetEnumIfPresent(GstElement *_element,
+				     const char *_property,
+				     gint _value);
+        static bool SetEnumNickIfPresent(GstElement *_element,
+                                 const char *_property,
+                                 const char *_nick);
 	static void SetBoolIfPresent(GstElement *_element,
 				     const char *_property,
 				     gboolean _value);

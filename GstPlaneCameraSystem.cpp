@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -163,6 +164,7 @@ GstPlaneCameraSystem::~GstPlaneCameraSystem()
 		stream->removed.store(true, std::memory_order_release);
 		stream->frameRequested.store(false, std::memory_order_release);
 		stream->camera.reset();
+		StopFrameWorker(*stream);
 		StopPipeline(*stream);
 	}
 
@@ -171,14 +173,10 @@ GstPlaneCameraSystem::~GstPlaneCameraSystem()
 
 //////////////////////////////////////////////////
 void GstPlaneCameraSystem::Configure(const gz::sim::Entity &_entity,
-				const std::shared_ptr<const sdf::Element> &/*_sdf*/,
+				const std::shared_ptr<const sdf::Element> &,
 				gz::sim::EntityComponentManager &_ecm,
 				gz::sim::EventManager &_eventMgr)
 {
-	// PX4 loads one GstPlaneCameraSystem at WORLD scope from server.config before it
-	// dynamically spawns the aircraft. That world instance is the only active
-	// instance. <sensor><plugin> entries are used only as per-camera metadata;
-	// if Harmonic also instantiates those plugins, they intentionally stay idle.
 	if (!_ecm.EntityHasComponentType(_entity, gz::sim::components::World::typeId)) {
 		return;
 	}
@@ -189,7 +187,7 @@ void GstPlaneCameraSystem::Configure(const gz::sim::Entity &_entity,
 	_renderTeardownConnection = _eventMgr.Connect<gz::sim::events::RenderTeardown>(
 		std::bind(&GstPlaneCameraSystem::OnRenderTeardown, this));
 
-	std::cerr << "[GstPlaneCameraSystem] active WORLD existing-camera COPY streamer loaded; "
+	std::cerr << "[GstPlaneCameraSystem] active WORLD existing-camera native-frame streamer loaded; "
 		     "waiting for camera entities" << std::endl;
 }
 
@@ -206,7 +204,6 @@ bool GstPlaneCameraSystem::ParseStreamConfig(const sdf::Sensor &_sensor,
 		}
 	}
 
-	// Only cameras explicitly carrying GstPlaneCameraSystem metadata are streamed.
 	if (!gstPlugin) {
 		return false;
 	}
@@ -311,6 +308,8 @@ void GstPlaneCameraSystem::DiscoverStreams(const gz::sim::EntityComponentManager
 				_streams.emplace_back(stream);
 			}
 
+			StartFrameWorker(stream);
+
 			std::cerr << "[GstPlaneCameraSystem] discovered camera entity " << _entity
 				  << " [" << _nameComp->Data() << "] -> "
 				  << stream->udpHost << ':' << stream->udpPort
@@ -353,15 +352,13 @@ void GstPlaneCameraSystem::RemoveStreams(const gz::sim::EntityComponentManager &
 		});
 
 	for (auto &stream : removedStreams) {
+		StopFrameWorker(*stream);
 		StopPipeline(*stream);
 		std::cerr << "[GstPlaneCameraSystem] removed camera entity " << stream->entity
 			  << " [" << stream->cameraName << "]" << std::endl;
 	}
 
 	if (!removedStreams.empty()) {
-		// Keep the rendering references alive until a render-thread callback can
-		// release them. This avoids making the simulation thread the last owner of
-		// an Ogre-backed rendering camera during a vehicle despawn.
 		std::lock_guard<std::mutex> lock(_streamsMutex);
 		_retiredStreams.insert(_retiredStreams.end(),
 			removedStreams.begin(), removedStreams.end());
@@ -387,7 +384,6 @@ void GstPlaneCameraSystem::ReleaseRetiredStreamsOnRenderThread()
 	for (auto &stream : retired) {
 		stream->camera.reset();
 	}
-	// 'retired' is intentionally destroyed here on Gazebo's rendering thread.
 }
 
 //////////////////////////////////////////////////
@@ -398,9 +394,6 @@ void GstPlaneCameraSystem::PostUpdate(const gz::sim::UpdateInfo &_info,
 		return;
 	}
 
-	// Sensors is loaded before GstPlaneCameraSystem in PX4's server.config. Its next
-	// PostUpdate waits for the previous rendering pass to finish, so by the time
-	// we reach this point it is safe to release our previous one-shot callback.
 	if (_renderCallbackDone.exchange(false, std::memory_order_acq_rel)) {
 		{
 			std::lock_guard<std::mutex> lock(_renderConnectionMutex);
@@ -409,7 +402,6 @@ void GstPlaneCameraSystem::PostUpdate(const gz::sim::UpdateInfo &_info,
 		_renderPending.store(false, std::memory_order_release);
 	}
 
-	// Each() also sees entities marked for removal, so discover first and remove last.
 	DiscoverStreams(_ecm);
 	RemoveStreams(_ecm);
 
@@ -443,7 +435,6 @@ void GstPlaneCameraSystem::ScheduleRender(const gz::sim::UpdateInfo &_info,
 				static_cast<int64_t>(1000000000ULL / stream->rate)));
 
 		if (!stream->scheduleInitialized || _info.simTime < stream->lastSimTime) {
-			// Reinitialize after first discovery or a simulation-time reset.
 			stream->nextFrameTime = _info.simTime;
 			stream->scheduleInitialized = true;
 		}
@@ -453,7 +444,6 @@ void GstPlaneCameraSystem::ScheduleRender(const gz::sim::UpdateInfo &_info,
 			stream->frameRequested.store(true, std::memory_order_release);
 			anyDue = true;
 
-			// Advance in one step instead of looping if simulation time jumps forward.
 			const auto overdue = _info.simTime - stream->nextFrameTime;
 			const auto periodsToAdvance = overdue / period + 1;
 			stream->nextFrameTime += period * periodsToAdvance;
@@ -476,10 +466,6 @@ void GstPlaneCameraSystem::ScheduleRender(const gz::sim::UpdateInfo &_info,
 			std::bind(&GstPlaneCameraSystem::OnRender, this));
 	}
 
-	// The Sensors system is earlier in PX4's server.config, so this ForceRender
-	// flag is consumed on its next PostUpdate. By the time events::Render is
-	// emitted, the built-in CameraSensor already exists and Scene::PreRender()
-	// has prepared its Ogre2 render target.
 	_eventManager->Emit<gz::sim::events::ForceRender>();
 }
 
@@ -511,10 +497,6 @@ void GstPlaneCameraSystem::OnRender()
 			continue;
 		}
 
-		// Reuse Gazebo Sensors' own rendering camera. It already existed during
-		// Scene::PreRender(), so Ogre2 has a valid compositor / render target.
-		// The gz::sensors CameraSensor itself can stay transport-inactive; we
-		// render the underlying gz::rendering::Camera directly here.
 		if (!FindExistingCamera(*stream)) {
 			continue;
 		}
@@ -614,17 +596,13 @@ void GstPlaneCameraSystem::RenderCamera(StreamState &_stream)
 	}
 
 	if (!_stream.renderCallReported) {
-		std::cerr << "[GstPlaneCameraSystem] first direct Render/PostRender ["
+		std::cerr << "[GstPlaneCameraSystem] first direct Render/PostRender/Copy ["
 			  << _stream.cameraName << "]" << std::endl;
 		_stream.renderCallReported = true;
 	}
 
 	_stream.camera->Render();
 	_stream.camera->PostRender();
-
-	// Do exactly what Gazebo CameraSensor does after rendering, but stop before
-	// constructing / publishing gz::msgs::Image: copy the last rendered frame
-	// straight into a gz::rendering::Image owned by this stream.
 	_stream.camera->Copy(_stream.image);
 
 	const void *data = _stream.image.Data();
@@ -637,8 +615,11 @@ void GstPlaneCameraSystem::RenderCamera(StreamState &_stream)
 		return;
 	}
 
-	const uint64_t expectedBytes = static_cast<uint64_t>(_stream.image.Width())
-		* _stream.image.Height() * _stream.image.Depth();
+	const unsigned int width = _stream.image.Width();
+	const unsigned int height = _stream.image.Height();
+	const unsigned int depth = _stream.image.Depth();
+	const uint64_t expectedBytes = static_cast<uint64_t>(width) * height * depth;
+
 	if (_stream.image.MemorySize() < expectedBytes) {
 		if (!_stream.formatWarningReported) {
 			gzwarn << "GstPlaneCameraSystem: Camera::Copy returned an undersized image for ["
@@ -649,20 +630,115 @@ void GstPlaneCameraSystem::RenderCamera(StreamState &_stream)
 		return;
 	}
 
-	if (!_stream.frameCopyReported) {
-		std::cerr << "[GstPlaneCameraSystem] direct Camera::Copy frame ["
-			  << _stream.cameraName << "] " << _stream.image.Width() << 'x'
-			  << _stream.image.Height() << " depth=" << _stream.image.Depth()
-			  << " bytes=" << _stream.image.MemorySize() << std::endl;
-		_stream.frameCopyReported = true;
+	OnNewFrame(_stream, data, width, height, depth, "Camera::Copy");
+}
+
+//////////////////////////////////////////////////
+void GstPlaneCameraSystem::StartFrameWorker(const StreamPtr &_stream)
+{
+	if (!_stream || _stream->frameWorker.joinable()) {
+		return;
 	}
 
-	OnNewFrame(_stream,
-		   data,
-		   _stream.image.Width(),
-		   _stream.image.Height(),
-		   _stream.image.Depth(),
-		   "Camera::Copy");
+	{
+		std::lock_guard<std::mutex> lock(_stream->frameMutex);
+		_stream->frameWorkerStop = false;
+		_stream->frameReady = false;
+	}
+
+	_stream->frameWorker = std::thread([this, _stream]() { FrameWorker(_stream); });
+}
+
+//////////////////////////////////////////////////
+void GstPlaneCameraSystem::StopFrameWorker(StreamState &_stream)
+{
+	{
+		std::lock_guard<std::mutex> lock(_stream.frameMutex);
+		_stream.frameWorkerStop = true;
+		_stream.frameReady = false;
+	}
+	_stream.frameCv.notify_all();
+
+	if (_stream.frameWorker.joinable()) {
+		_stream.frameWorker.join();
+	}
+
+	std::lock_guard<std::mutex> lock(_stream.frameMutex);
+	_stream.pendingFrame.clear();
+	_stream.pendingWidth = 0;
+	_stream.pendingHeight = 0;
+}
+
+//////////////////////////////////////////////////
+void GstPlaneCameraSystem::FrameWorker(const StreamPtr &_stream)
+{
+	std::vector<uint8_t> frame;
+
+	while (!_shuttingDown.load(std::memory_order_acquire)) {
+		unsigned int width = 0;
+		unsigned int height = 0;
+
+		{
+			std::unique_lock<std::mutex> lock(_stream->frameMutex);
+			_stream->frameCv.wait(lock, [this, _stream]() {
+				return _stream->frameWorkerStop || _stream->frameReady
+			       || _shuttingDown.load(std::memory_order_acquire);
+			});
+
+			if (_stream->frameWorkerStop || _shuttingDown.load(std::memory_order_acquire)) {
+				break;
+			}
+
+			frame.swap(_stream->pendingFrame);
+			width = _stream->pendingWidth;
+			height = _stream->pendingHeight;
+			_stream->frameReady = false;
+		}
+
+		if (_stream->removed.load(std::memory_order_acquire) || frame.empty()) {
+			continue;
+		}
+
+		if (!StartPipeline(*_stream, width, height)) {
+			continue;
+		}
+
+		GstBuffer *buffer = gst_buffer_new_allocate(nullptr,
+			static_cast<gsize>(frame.size()), nullptr);
+		if (!buffer) {
+			continue;
+		}
+
+		if (gst_buffer_fill(buffer, 0, frame.data(), frame.size()) != frame.size()) {
+			gst_buffer_unref(buffer);
+			continue;
+		}
+
+		GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, _stream->rate);
+		_stream->frameIndex.fetch_add(1, std::memory_order_relaxed);
+
+		GstElement *source = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(_stream->gstMutex);
+			if (_stream->source) {
+				source = GST_ELEMENT(gst_object_ref(_stream->source));
+			}
+		}
+
+		if (!source) {
+			gst_buffer_unref(buffer);
+			continue;
+		}
+
+		const GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(source), buffer);
+		gst_object_unref(source);
+
+		if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING) {
+			gzerr << "GstPlaneCameraSystem: appsrc push failed for [" << _stream->cameraName
+			      << "]: " << ret << std::endl;
+			HandlePipelineFailure(*_stream, false);
+		}
+	}
 }
 
 //////////////////////////////////////////////////
@@ -678,11 +754,10 @@ void GstPlaneCameraSystem::OnNewFrame(StreamState &_stream,
 		return;
 	}
 
-	// Raw pixels arrive here from Camera::Copy(), not Gazebo Transport.
 	if (!_stream.rawFrameReported) {
-		std::cerr << "[GstPlaneCameraSystem] raw copied frame [" << _stream.cameraName
+		std::cerr << "[GstPlaneCameraSystem] copied camera frame [" << _stream.cameraName
 			  << "] " << _width << 'x' << _height << " depth=" << _depth
-			  << " format=[" << _format << "]" << std::endl;
+			  << " source=[" << _format << "]" << std::endl;
 		_stream.rawFrameReported = true;
 	}
 
@@ -696,47 +771,25 @@ void GstPlaneCameraSystem::OnNewFrame(StreamState &_stream,
 		return;
 	}
 
-	if (!StartPipeline(_stream, _width, _height)) {
-		return;
-	}
-
-	const gsize bytes = static_cast<gsize>(_width) * _height * 3u;
-	GstBuffer *buffer = gst_buffer_new_allocate(nullptr, bytes, nullptr);
-	if (!buffer) {
-		return;
-	}
-
-	if (gst_buffer_fill(buffer, 0, _image, bytes) != bytes) {
-		gst_buffer_unref(buffer);
-		return;
-	}
-
-	const uint64_t index = _stream.frameIndex.fetch_add(1, std::memory_order_relaxed);
-	GST_BUFFER_PTS(buffer) = gst_util_uint64_scale(index, GST_SECOND, _stream.rate);
-	GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
-	GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, _stream.rate);
-
-	GstElement *source = nullptr;
+	const size_t bytes = static_cast<size_t>(_width) * _height * 3u;
 	{
-		std::lock_guard<std::mutex> lock(_stream.gstMutex);
-		if (_stream.source) {
-			source = GST_ELEMENT(gst_object_ref(_stream.source));
+		std::lock_guard<std::mutex> lock(_stream.frameMutex);
+		if (_stream.frameWorkerStop) {
+			return;
 		}
+
+		if (_stream.frameReady) {
+			_stream.droppedFrames.fetch_add(1, std::memory_order_relaxed);
+		}
+
+		_stream.pendingFrame.resize(bytes);
+		std::memcpy(_stream.pendingFrame.data(), _image, bytes);
+		_stream.pendingWidth = _width;
+		_stream.pendingHeight = _height;
+		_stream.frameReady = true;
 	}
 
-	if (!source) {
-		gst_buffer_unref(buffer);
-		return;
-	}
-
-	const GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(source), buffer);
-	gst_object_unref(source);
-
-	if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING) {
-		gzerr << "GstPlaneCameraSystem: appsrc push failed for [" << _stream.cameraName
-		      << "]: " << ret << std::endl;
-		HandlePipelineFailure(_stream, true);
-	}
+	_stream.frameCv.notify_one();
 }
 
 //////////////////////////////////////////////////
@@ -765,16 +818,27 @@ bool GstPlaneCameraSystem::StartPipeline(StreamState &_stream,
 	}
 
 	if (_stream.useCuda && !_stream.nvencFailed) {
-		if (BuildPipelineLocked(_stream, _width, _height, true)) {
+		if (!_stream.gpuConvertFailed) {
+			if (BuildPipelineLocked(_stream, _width, _height, true, true)) {
+				return true;
+			}
+
+			_stream.gpuConvertFailed = true;
+			gzwarn << "GstPlaneCameraSystem: CUDA upload/convert path failed for ["
+			       << _stream.cameraName << "], retrying NVENC with CPU color conversion"
+			       << std::endl;
+		}
+
+		if (BuildPipelineLocked(_stream, _width, _height, true, false)) {
 			return true;
 		}
 
 		_stream.nvencFailed = true;
-		gzwarn << "GstPlaneCameraSystem: nvh264enc unavailable or failed for [" << _stream.cameraName
-		       << "], falling back to x264" << std::endl;
+		gzwarn << "GstPlaneCameraSystem: nvh264enc unavailable or failed for ["
+		       << _stream.cameraName << "], falling back to x264" << std::endl;
 	}
 
-	if (BuildPipelineLocked(_stream, _width, _height, false)) {
+	if (BuildPipelineLocked(_stream, _width, _height, false, false)) {
 		return true;
 	}
 
@@ -786,19 +850,31 @@ bool GstPlaneCameraSystem::StartPipeline(StreamState &_stream,
 bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 					       unsigned int _width,
 					       unsigned int _height,
-					       bool _useNvenc)
+					       bool _useNvenc,
+					       bool _gpuConvert)
 {
 	GstElement *pipeline = gst_pipeline_new(nullptr);
 	GstElement *source = gst_element_factory_make("appsrc", nullptr);
 	GstElement *queue = gst_element_factory_make("queue", nullptr);
-	GstElement *converter = gst_element_factory_make("videoconvert", nullptr);
+	GstElement *converter = nullptr;
+	GstElement *cudaUpload = nullptr;
+	GstElement *cudaConvert = nullptr;
 	GstElement *capsFilter = gst_element_factory_make("capsfilter", nullptr);
 	GstElement *encoder = gst_element_factory_make(_useNvenc ? "nvh264enc" : "x264enc", nullptr);
 	GstElement *payloader = gst_element_factory_make("rtph264pay", nullptr);
 	GstElement *sink = gst_element_factory_make("udpsink", nullptr);
 
-	if (!pipeline || !source || !queue || !converter || !capsFilter
-	    || !encoder || !payloader || !sink) {
+	if (_useNvenc && _gpuConvert) {
+		cudaUpload = gst_element_factory_make("cudaupload", nullptr);
+		cudaConvert = gst_element_factory_make("cudaconvert", nullptr);
+	} else {
+		converter = gst_element_factory_make("videoconvert", nullptr);
+	}
+
+	const bool elementsOk = pipeline && source && queue && capsFilter && encoder && payloader && sink
+		&& ((_useNvenc && _gpuConvert) ? (cudaUpload && cudaConvert) : (converter != nullptr));
+
+	if (!elementsOk) {
 		if (!_useNvenc) {
 			gzerr << "GstPlaneCameraSystem: failed to create GStreamer elements for ["
 			      << _stream.cameraName << "]" << std::endl;
@@ -807,6 +883,8 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 		if (source) { gst_object_unref(source); }
 		if (queue) { gst_object_unref(queue); }
 		if (converter) { gst_object_unref(converter); }
+		if (cudaUpload) { gst_object_unref(cudaUpload); }
+		if (cudaConvert) { gst_object_unref(cudaConvert); }
 		if (capsFilter) { gst_object_unref(capsFilter); }
 		if (encoder) { gst_object_unref(encoder); }
 		if (payloader) { gst_object_unref(payloader); }
@@ -832,6 +910,11 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 		"framerate", GST_TYPE_FRACTION, _stream.rate, 1,
 		nullptr);
 
+	if (encoderCaps && _useNvenc && _gpuConvert) {
+		gst_caps_set_features(encoderCaps, 0,
+			gst_caps_features_new("memory:CUDAMemory", nullptr));
+	}
+
 	if (!sourceCaps || !encoderCaps) {
 		gzerr << "GstPlaneCameraSystem: failed to create video caps for ["
 		      << _stream.cameraName << "]" << std::endl;
@@ -839,7 +922,9 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 		if (encoderCaps) { gst_caps_unref(encoderCaps); }
 		gst_object_unref(source);
 		gst_object_unref(queue);
-		gst_object_unref(converter);
+		if (converter) { gst_object_unref(converter); }
+		if (cudaUpload) { gst_object_unref(cudaUpload); }
+		if (cudaConvert) { gst_object_unref(cudaConvert); }
 		gst_object_unref(capsFilter);
 		gst_object_unref(encoder);
 		gst_object_unref(payloader);
@@ -851,18 +936,18 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 	g_object_set(G_OBJECT(source),
 		"caps", sourceCaps,
 		"is-live", TRUE,
-		"do-timestamp", FALSE,
+		"do-timestamp", TRUE,
 		"stream-type", GST_APP_STREAM_TYPE_STREAM,
 		"format", GST_FORMAT_TIME,
 		"block", FALSE,
 		"emit-signals", FALSE,
-		"max-bytes", rawFrameBytes * 2u,
+		"max-bytes", rawFrameBytes,
 		nullptr);
 	gst_caps_unref(sourceCaps);
 
 	GObjectClass *sourceClass = G_OBJECT_GET_CLASS(source);
 	if (g_object_class_find_property(sourceClass, "max-buffers")) {
-		g_object_set(G_OBJECT(source), "max-buffers", static_cast<guint64>(2), nullptr);
+		g_object_set(G_OBJECT(source), "max-buffers", static_cast<guint64>(1), nullptr);
 	}
 	if (g_object_class_find_property(sourceClass, "leaky-type")) {
 		g_object_set(G_OBJECT(source), "leaky-type", 2, nullptr);
@@ -873,7 +958,24 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 
 	if (_useNvenc) {
 		SetUintIfPresent(encoder, "bitrate", _stream.bitrateKbps);
+		SetIntIfPresent(encoder, "gop-size", 10);
+		SetUintIfPresent(encoder, "bframes", 0);
+		SetUintIfPresent(encoder, "rc-lookahead", 0);
 		SetBoolIfPresent(encoder, "zerolatency", TRUE);
+		SetBoolIfPresent(encoder, "repeat-sequence-header", TRUE);
+		SetBoolIfPresent(encoder, "strict-gop", TRUE);
+
+		if (!SetEnumNickIfPresent(encoder, "preset", "p4")) {
+                  SetEnumNickIfPresent(encoder, "preset", "low-latency-hq");
+                }
+                SetEnumNickIfPresent(encoder, "tune", "ultra-low-latency");
+                SetEnumNickIfPresent(encoder, "rc-mode", "cbr");
+                SetEnumNickIfPresent(encoder, "multi-pass", "disabled");
+
+		const guint vbvKbits = std::max<guint>(256u,
+			static_cast<guint>((static_cast<uint64_t>(_stream.bitrateKbps) * 2u)
+				/ std::max(1u, _stream.rate)));
+		SetUintIfPresent(encoder, "vbv-buffer-size", vbvKbits);
 	} else {
 		g_object_set(G_OBJECT(encoder),
 			"bitrate", _stream.bitrateKbps,
@@ -881,25 +983,43 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 			"tune", 4,
 			"key-int-max", 10,
 			nullptr);
+		SetBoolIfPresent(encoder, "byte-stream", TRUE);
+		SetBoolIfPresent(encoder, "sliced-threads", TRUE);
 	}
 
 	g_object_set(G_OBJECT(payloader),
-		"config-interval", 1,
-		"mtu", 1400,
+		"config-interval", -1,
+		"mtu", 1200u,
 		"pt", 96u,
 		nullptr);
+
 	g_object_set(G_OBJECT(sink),
 		"host", _stream.udpHost.c_str(),
 		"port", _stream.udpPort,
 		"sync", FALSE,
 		"async", FALSE,
 		nullptr);
+	SetIntIfPresent(sink, "buffer-size", 4 * 1024 * 1024);
+	SetBoolIfPresent(sink, "qos", FALSE);
 
-	gst_bin_add_many(GST_BIN(pipeline), source, queue, converter, capsFilter,
-		encoder, payloader, sink, nullptr);
+	if (_useNvenc && _gpuConvert) {
+		gst_bin_add_many(GST_BIN(pipeline), source, queue, cudaUpload, cudaConvert,
+			capsFilter, encoder, payloader, sink, nullptr);
+	} else {
+		gst_bin_add_many(GST_BIN(pipeline), source, queue, converter, capsFilter,
+			encoder, payloader, sink, nullptr);
+	}
 
-	if (!gst_element_link_many(source, queue, converter, capsFilter, encoder,
-		payloader, sink, nullptr)) {
+	bool linked = false;
+	if (_useNvenc && _gpuConvert) {
+		linked = gst_element_link_many(source, queue, cudaUpload, cudaConvert,
+			capsFilter, encoder, payloader, sink, nullptr);
+	} else {
+		linked = gst_element_link_many(source, queue, converter, capsFilter,
+			encoder, payloader, sink, nullptr);
+	}
+
+	if (!linked) {
 		if (!_useNvenc) {
 			gzerr << "GstPlaneCameraSystem: failed to link GStreamer pipeline for ["
 			      << _stream.cameraName << "]" << std::endl;
@@ -926,12 +1046,18 @@ bool GstPlaneCameraSystem::BuildPipelineLocked(StreamState &_stream,
 	_stream.height = _height;
 	_stream.frameIndex.store(0, std::memory_order_relaxed);
 	_stream.usingNvenc = _useNvenc;
+	_stream.usingGpuConvert = _useNvenc && _gpuConvert;
 	_stream.nextPipelineRetry = {};
 
 	std::cerr << "[GstPlaneCameraSystem] STREAMING [" << _stream.cameraName << "] "
 		  << _width << 'x' << _height << " @ " << _stream.rate << " FPS -> "
-		  << _stream.udpHost << ':' << _stream.udpPort << " using "
-		  << (_useNvenc ? "nvh264enc" : "x264") << std::endl;
+		  << _stream.udpHost << ':' << _stream.udpPort << " using ";
+	if (_useNvenc) {
+		std::cerr << (_gpuConvert ? "nvh264enc + CUDA RGB->NV12" : "nvh264enc + CPU RGB->NV12");
+	} else {
+		std::cerr << "x264";
+	}
+	std::cerr << std::endl;
 	return true;
 }
 
@@ -965,6 +1091,7 @@ void GstPlaneCameraSystem::StopPipelineLocked(StreamState &_stream)
 	_stream.height = 0;
 	_stream.frameIndex.store(0, std::memory_order_relaxed);
 	_stream.usingNvenc = false;
+	_stream.usingGpuConvert = false;
 }
 
 //////////////////////////////////////////////////
@@ -985,11 +1112,13 @@ void GstPlaneCameraSystem::PollBus(StreamState &_stream)
 {
 	GstBus *bus = nullptr;
 	bool busUsingNvenc = false;
+	bool busUsingGpuConvert = false;
 	{
 		std::lock_guard<std::mutex> lock(_stream.gstMutex);
 		if (_stream.bus) {
 			bus = GST_BUS(gst_object_ref(_stream.bus));
 			busUsingNvenc = _stream.usingNvenc;
+			busUsingGpuConvert = _stream.usingGpuConvert;
 		}
 	}
 
@@ -1031,14 +1160,16 @@ void GstPlaneCameraSystem::PollBus(StreamState &_stream)
 		gst_message_unref(msg);
 	}
 
+	bool disabledGpuConvert = false;
 	bool disabledNvenc = false;
 	if (fatal) {
 		std::lock_guard<std::mutex> lock(_stream.gstMutex);
 
-		// Only tear down the pipeline that produced this bus message. A render
-		// callback may already have replaced the pipeline after a resize/failure.
 		if (_stream.bus == bus) {
-			if (busUsingNvenc) {
+			if (busUsingNvenc && busUsingGpuConvert) {
+				_stream.gpuConvertFailed = true;
+				disabledGpuConvert = true;
+			} else if (busUsingNvenc) {
 				_stream.nvencFailed = true;
 				disabledNvenc = true;
 			}
@@ -1050,6 +1181,12 @@ void GstPlaneCameraSystem::PollBus(StreamState &_stream)
 	}
 
 	gst_object_unref(bus);
+
+	if (disabledGpuConvert) {
+		gzwarn << "GstPlaneCameraSystem: disabling CUDA RGB->NV12 for ["
+		       << _stream.cameraName << "] after a runtime pipeline failure; "
+		       << "NVENC will retry with CPU color conversion" << std::endl;
+	}
 
 	if (disabledNvenc) {
 		gzwarn << "GstPlaneCameraSystem: disabling NVENC for [" << _stream.cameraName
@@ -1063,9 +1200,6 @@ void GstPlaneCameraSystem::OnRenderTeardown()
 	_shuttingDown.store(true, std::memory_order_release);
 	std::lock_guard<std::mutex> renderLock(_renderExecutionMutex);
 
-	// This callback runs on the Sensors rendering thread. Camera pointers are
-	// borrowed from Gazebo Sensors; release our references without destroying
-	// the underlying rendering sensors.
 	ReleaseRetiredStreamsOnRenderThread();
 	for (auto &stream : StreamSnapshot()) {
 		stream->frameRequested.store(false, std::memory_order_release);
@@ -1083,7 +1217,7 @@ void GstPlaneCameraSystem::ConfigureLeakyQueue(GstElement *_queue)
 	}
 
 	g_object_set(G_OBJECT(_queue),
-		"max-size-buffers", 2u,
+		"max-size-buffers", 1u,
 		"max-size-bytes", 0u,
 		"max-size-time", static_cast<guint64>(0),
 		"leaky", 2,
@@ -1099,6 +1233,71 @@ void GstPlaneCameraSystem::SetUintIfPresent(GstElement *_element,
 	if (_element && g_object_class_find_property(G_OBJECT_GET_CLASS(_element), _property)) {
 		g_object_set(G_OBJECT(_element), _property, _value, nullptr);
 	}
+}
+
+//////////////////////////////////////////////////
+void GstPlaneCameraSystem::SetIntIfPresent(GstElement *_element,
+				       const char *_property,
+				       gint _value)
+{
+	if (_element && g_object_class_find_property(G_OBJECT_GET_CLASS(_element), _property)) {
+		g_object_set(G_OBJECT(_element), _property, _value, nullptr);
+	}
+}
+
+//////////////////////////////////////////////////
+void GstPlaneCameraSystem::SetEnumIfPresent(GstElement *_element,
+				        const char *_property,
+				        gint _value)
+{
+	if (_element && g_object_class_find_property(G_OBJECT_GET_CLASS(_element), _property)) {
+		g_object_set(G_OBJECT(_element), _property, _value, nullptr);
+	}
+}
+
+bool GstPlaneCameraSystem::SetEnumNickIfPresent(
+    GstElement *_element,
+    const char *_property,
+    const char *_nick)
+{
+    if (!_element || !_property || !_nick) {
+        return false;
+    }
+
+    GObjectClass *objectClass = G_OBJECT_GET_CLASS(_element);
+    GParamSpec *pspec =
+        g_object_class_find_property(objectClass, _property);
+
+    if (!pspec || !G_IS_PARAM_SPEC_ENUM(pspec)) {
+        return false;
+    }
+
+    GType enumType = G_PARAM_SPEC_VALUE_TYPE(pspec);
+    GEnumClass *enumClass =
+        G_ENUM_CLASS(g_type_class_ref(enumType));
+
+    if (!enumClass) {
+        return false;
+    }
+
+    const GEnumValue *value =
+        g_enum_get_value_by_nick(enumClass, _nick);
+
+    if (!value) {
+        g_type_class_unref(enumClass);
+        return false;
+    }
+
+    const gint enumValue = value->value;
+    g_type_class_unref(enumClass);
+
+    g_object_set(
+        G_OBJECT(_element),
+        _property,
+        enumValue,
+        nullptr);
+
+    return true;
 }
 
 //////////////////////////////////////////////////

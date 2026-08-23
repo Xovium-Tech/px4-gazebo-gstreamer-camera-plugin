@@ -96,8 +96,6 @@ private:
 		unsigned int height{0};
 		std::atomic<uint64_t> frameIndex{0};
 		bool usingNvenc{false};
-		bool usingGpuConvert{false};
-		bool gpuConvertFailed{false};
 		bool nvencFailed{false};
 		std::chrono::steady_clock::time_point nextPipelineRetry{};
 
@@ -137,7 +135,7 @@ private:
 	void OnRenderTeardown();
 	bool FindScene();
 	bool FindExistingCamera(StreamState &_stream);
-	void RenderCamera(StreamState &_stream);
+	void CopyCameraFrame(StreamState &_stream);
 
 	void StartFrameWorker(const StreamPtr &_stream);
 	void StopFrameWorker(StreamState &_stream);
@@ -156,8 +154,7 @@ private:
 	bool BuildPipelineLocked(StreamState &_stream,
 				 unsigned int _width,
 				 unsigned int _height,
-				 bool _useNvenc,
-				 bool _gpuConvert);
+				 bool _useNvenc);
 	void StopPipeline(StreamState &_stream);
 	void StopPipelineLocked(StreamState &_stream);
 	void HandlePipelineFailure(StreamState &_stream, bool _disableNvenc);
@@ -189,11 +186,8 @@ private:
 	std::unordered_set<gz::sim::Entity> _knownCameraEntities;
 
 	std::mutex _renderExecutionMutex;
-	std::mutex _renderConnectionMutex;
 	gz::common::ConnectionPtr _renderConnection;
 	gz::common::ConnectionPtr _renderTeardownConnection;
-	std::atomic<bool> _renderPending{false};
-	std::atomic<bool> _renderCallbackDone{false};
 	std::atomic<bool> _shuttingDown{false};
 	bool _activeWorldInstance{false};
 };

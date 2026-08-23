@@ -213,10 +213,11 @@ Replace `gz_rc_cessna` with your PX4 Gazebo model target.
 A successful startup should contain messages similar to:
 
 ```
-[GstPlaneCameraSystem] active WORLD existing-camera COPY streamer loaded
+[GstPlaneCameraSystem] active WORLD direct-rendering-camera streamer loaded
 [GstPlaneCameraSystem] discovered camera entity ...
 [GstPlaneCameraSystem] attached DIRECTLY to Gazebo rendering camera ...
 [GstPlaneCameraSystem] STREAMING [camera_front] ... -> 127.0.0.1:5606 using x264
+[GstPlaneCameraSystem] first appsrc frame pushed [camera_front]
 ```
 
 ## View the stream
@@ -293,7 +294,7 @@ The plugin will try to use `nvh264enc`. If it is unavailable or fails to start, 
 
 If an active GStreamer pipeline reports a fatal error or EOS, the stream is stopped and retried after a short delay. If NVENC fails at runtime, that camera falls back to x264 for the rest of the plugin instance.
 
-`use_cuda=true` only changes the H.264 encoder. Gazebo rendering and the frame copy are not CUDA zero-copy.
+`use_cuda=true` uses `nvh264enc` for H.264 encoding. RGB-to-NV12 conversion still runs through `videoconvert` on the CPU; Gazebo rendering and the frame copy are not CUDA zero-copy.
 
 ## How it works
 

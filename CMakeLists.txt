@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 project(GstPlaneCameraSystem LANGUAGES CXX)
 
 include(GNUInstallDirs)
+include(CTest)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -66,3 +67,12 @@ install(
     TARGETS ${PROJECT_NAME}
     LIBRARY DESTINATION "${GST_PLANE_CAMERA_INSTALL_DIR}"
 )
+
+if(BUILD_TESTING)
+    add_executable(GstPlaneCameraConfigTest
+        tests/GstPlaneCameraConfigTest.cpp
+    )
+    target_compile_features(GstPlaneCameraConfigTest PRIVATE cxx_std_17)
+    target_include_directories(GstPlaneCameraConfigTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME GstPlaneCameraConfigTest COMMAND GstPlaneCameraConfigTest)
+endif()

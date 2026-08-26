@@ -31,6 +31,7 @@
 
 
 #include "GstPlaneCameraSystem.hpp"
+#include "GstPlaneCameraConfig.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -71,8 +72,7 @@ constexpr auto kPipelineRetryDelay = std::chrono::seconds(1);
 
 std::string DefaultHost()
 {
-	const char *host = std::getenv("PX4_VIDEO_HOST_IP");
-	return host ? std::string(host) : std::string("127.0.0.1");
+	return custom::detail::DefaultUdpHost(std::getenv("PX4_VIDEO_HOST_IP"));
 }
 
 bool IsGstConfigPlugin(const sdf::Plugin &_plugin)

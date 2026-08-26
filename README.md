@@ -268,6 +268,8 @@ You can also omit `udp_host` from the camera configuration and set:
 export PX4_VIDEO_HOST_IP=192.168.1.100
 ```
 
+An unset or empty `PX4_VIDEO_HOST_IP` uses `127.0.0.1`.
+
 ## Configuration
 
 | Parameter           |             Default | Description                           |

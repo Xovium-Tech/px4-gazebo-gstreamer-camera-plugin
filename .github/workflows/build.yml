@@ -1,0 +1,60 @@
+name: Build and smoke test
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install simulator-independent dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly
+      - name: Build and test without any Gazebo packages
+        run: |
+          cmake -S . -B build-core -G Ninja -DGST_PLANE_CAMERA_BUILD_PLUGIN=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-core -j2
+          ctest --test-dir build-core --output-on-failure
+
+  gazebo:
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [harmonic, jetty]
+    runs-on: ubuntu-24.04
+    # Each distribution is installed into its own clean container and cache.
+    container: ubuntu:24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies for the selected Gazebo distribution
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl gnupg cmake ninja-build g++ pkg-config
+          curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable noble main' > /etc/apt/sources.list.d/gazebo-stable.list
+          apt-get update
+          apt-get install -y gz-${{ matrix.distro }} libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly libegl1-mesa-dev libgl1-mesa-dri
+      - name: Configure, compile, and verify dependencies
+        shell: bash
+        run: |
+          cmake -S . -B build-${{ matrix.distro }} -G Ninja -DGZ_DISTRO=${{ matrix.distro }} -DGST_PLANE_CAMERA_RUNTIME_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-${{ matrix.distro }} -j2
+          ctest --test-dir build-${{ matrix.distro }} --output-on-failure -E plugin.runtime
+      - name: Camera rendering smoke test
+        shell: bash
+        run: ctest --test-dir build-${{ matrix.distro }} --output-on-failure -R plugin.runtime
+      - name: Install to a staging prefix
+        shell: bash
+        run: cmake --install build-${{ matrix.distro }} --prefix "$RUNNER_TEMP/gst-plane-camera"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gazebo-${{ matrix.distro }}-logs
+          path: |
+            build-${{ matrix.distro }}/runtime-smoke.log
+            build-${{ matrix.distro }}/Testing/Temporary/LastTest.log

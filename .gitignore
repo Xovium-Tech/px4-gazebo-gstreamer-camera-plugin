@@ -1,5 +1,6 @@
 # CMake
 build/
+build-*/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
@@ -20,3 +21,5 @@ install_manifest.txt
 
 # Misc
 .DS_Store
+__pycache__/
+*.pyc

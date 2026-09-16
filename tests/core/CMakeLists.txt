@@ -1,0 +1,9 @@
+add_executable(stream_config_tests ConfigTests.cc)
+target_link_libraries(stream_config_tests PRIVATE gst_plane_camera_core)
+add_test(NAME core_config COMMAND stream_config_tests)
+
+add_executable(stream_pipeline_tests PipelineTests.cc)
+target_link_libraries(stream_pipeline_tests PRIVATE gst_plane_camera_core)
+add_test(NAME core_pipeline COMMAND stream_pipeline_tests)
+add_test(NAME core_nvenc COMMAND stream_pipeline_tests --nvenc)
+set_tests_properties(core_pipeline core_nvenc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)

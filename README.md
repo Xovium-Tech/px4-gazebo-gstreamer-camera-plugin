@@ -1,33 +1,78 @@
 # GstPlaneCameraSystem
 
-Direct rendering-camera streaming for PX4 SITL with **Gazebo Harmonic and Gazebo Jetty**. One Gazebo Sim adapter discovers configured cameras, copies RGB frames from `Camera::Copy()`, and passes them to one reusable GStreamer engine. Each camera has its own RTP/H.264 UDP stream, frame rate, bitrate, encoder choice, and retry state.
+[![CI](https://github.com/Xovium-Tech/px4-gazebo-gstreamer-camera-plugin/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Xovium-Tech/px4-gazebo-gstreamer-camera-plugin/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/Xovium-Tech/px4-gazebo-gstreamer-camera-plugin)](https://github.com/Xovium-Tech/px4-gazebo-gstreamer-camera-plugin/releases/latest)
 
-Gazebo Transport image subscriptions are not part of the frame path. PX4 is not a build dependency and this repository does not modify PX4 files.
+Direct low-latency H.264 camera streaming for PX4 SITL with
+**Gazebo Harmonic and Gazebo Jetty**.
 
-## Compatibility and layout
+`GstPlaneCameraSystem` reads RGB frames directly from Gazebo's rendering
+camera and sends them to GStreamer without routing camera images through
+Gazebo Transport.
 
-| Build selection | Simulator | Rendering | Plugin registration |
-| --- | --- | --- | --- |
-| `-DGZ_DISTRO=harmonic` | `gz-sim8` | `gz-rendering8` | `gz-plugin2` |
-| `-DGZ_DISTRO=jetty` | `gz-sim10` | `gz-rendering10` | `gz-plugin4` |
+It supports multiple cameras on the same simulated vehicle, with independent
+UDP destinations, frame rates, bitrates, and encoder settings.
 
-Both builds export `custom::GstPlaneCameraSystem` in `libGstPlaneCameraSystem.so`. They are **separate binaries**: a Harmonic binary links against `gz-sim8` and must never be loaded into Jetty; a Jetty binary must never be loaded into Harmonic. Select one distribution per environment, build directory, plugin search path, and installation prefix. CMake rejects unknown distributions and changing `GZ_DISTRO` in an existing cache.
+![PX4 SITL streaming two Gazebo camera feeds](images/multi-camera-demo.png)
 
-```text
-cmake/GazeboBackend.cmake            distribution/package/target selection
-include/gst_plane_camera/core/       simulator-independent configuration and frame API
-include/gst_plane_camera/adapters/   Gazebo Sim adapter declarations
-src/core/                           shared GStreamer engine
-src/adapters/gzsim/                  one adapter compiled for both distributions
-examples/harmonic/                  standalone world, model and server.config
-examples/jetty/                     equivalent Jetty examples
-tests/core/                         tests without Gazebo
-tests/cmake/                        backend/cache selection checks
-tests/smoke/                        linkage and rendering smoke checks
-tests/integration/                  camera removal and respawn checks
+## Features
+
+- Direct `Camera::Copy()` → GStreamer frame path
+- Multiple simultaneous camera streams
+- Independent UDP destination, frame rate, bitrate, and encoder settings per camera
+- RTP/H.264 output
+- x264 software encoding
+- Optional NVIDIA `nvh264enc` with automatic x264 fallback
+- Dynamic camera discovery, removal, and respawn handling
+- Gazebo Harmonic and Jetty from the same source tree
+
+## Compatibility
+
+| Gazebo | `gz-sim` | `gz-rendering` | `gz-plugin` | Build |
+| --- | ---: | ---: | ---: | --- |
+| Harmonic | 8 | 8 | 2 | `-DGZ_DISTRO=harmonic` |
+| Jetty | 10 | 10 | 4 | `-DGZ_DISTRO=jetty` |
+
+Harmonic and Jetty binaries are **not ABI-compatible**. Build or download
+the package matching your Gazebo distribution.
+
+Both builds produce `libGstPlaneCameraSystem.so` and export
+`custom::GstPlaneCameraSystem`. Use a separate build directory for each
+and expose only the matching binary in your plugin search path.
+
+## Quick start
+
+Install the [dependencies](#dependencies) for your Gazebo distribution, then
+run these commands from the repository root. PX4 is not a build dependency.
+
+### Jetty
+
+```bash
+cmake -S . -B build-jetty \
+  -DGZ_DISTRO=jetty \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-jetty -j"$(nproc)"
+
+export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build-jetty${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
 ```
 
-The original `GstPlaneCameraSystem.cpp/.hpp` responsibilities are split between the adapter and core. Gazebo lifecycle, entity discovery/removal, render events, scene and camera lookup, SDF parsing, and simulation-time frame scheduling stay in the adapter. GStreamer initialization, buffer ownership, appsrc, RGB conversion, x264/NVENC selection, timestamps, UDP output, errors/EOS, retries, workers, and shutdown belong to the core. Harmonic and Jetty use the same camera, event, and registration APIs; no empty compatibility layer or copied adapter is needed.
+### Harmonic
+
+```bash
+cmake -S . -B build-harmonic \
+  -DGZ_DISTRO=harmonic \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-harmonic -j"$(nproc)"
+
+export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build-harmonic${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
+```
+
+The libraries are created at `build-jetty/libGstPlaneCameraSystem.so` and
+`build-harmonic/libGstPlaneCameraSystem.so`. An omitted `GZ_DISTRO` defaults
+to Harmonic. CMake rejects switching distributions in an existing build cache.
+
+Continue with a [standalone example](#standalone-examples) or the
+[PX4 setup](#px4-integration).
 
 ## Dependencies
 
@@ -35,7 +80,7 @@ Install the development packages for **one** Gazebo distribution: [Harmonic inst
 
 Common build dependencies:
 
-```sh
+```bash
 sudo apt update
 sudo apt install -y build-essential cmake pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
@@ -43,7 +88,7 @@ sudo apt install -y build-essential cmake pkg-config \
 
 Runtime software encoding and the optional inspection/viewer commands:
 
-```sh
+```bash
 sudo apt install -y gstreamer1.0-tools \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
@@ -54,55 +99,20 @@ gst-inspect-1.0 nvh264enc  # Optional NVIDIA encoder
 
 The GStreamer command-line tools are not required to compile the library. No CUDA SDK or GPU is required to build it or run the normal core tests.
 
-## Build
-
-Run from the repository root. Choose the command matching the installed simulator.
-
-Harmonic:
-
-```sh
-cmake -S . -B build-harmonic \
-  -DGZ_DISTRO=harmonic \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-harmonic -j"$(nproc)"
-ctest --test-dir build-harmonic --output-on-failure
-```
-
-Jetty:
-
-```sh
-cmake -S . -B build-jetty \
-  -DGZ_DISTRO=jetty \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-jetty -j"$(nproc)"
-ctest --test-dir build-jetty --output-on-failure
-```
-
-Outputs are `build-harmonic/libGstPlaneCameraSystem.so` and `build-jetty/libGstPlaneCameraSystem.so`. An omitted `GZ_DISTRO` defaults to Harmonic for existing build commands. Never reuse a build cache between distributions.
-
-Inspect linkage in the matching environment:
-
-```sh
-ldd build-harmonic/libGstPlaneCameraSystem.so | grep gz
-ldd build-jetty/libGstPlaneCameraSystem.so | grep gz
-```
-
-The full `ldd` output must contain no `not found` entries. Harmonic must not link `gz-sim10`; Jetty must not link `gz-sim8`. The CTest `plugin.linkage` check enforces these checks automatically.
-
 ## Standalone examples
 
 Each world is self-contained, with Physics, UserCommands, Sensors using Ogre2, the stream system, a ground plane, a visible target, and two cameras. No PX4 checkout, downloaded models, or external meshes are needed. `camera_front` sends to port `5606` at 30 FPS / 16384 kbit/s; `camera_down` sends to port `5604` at 15 FPS / 4096 kbit/s.
 
 In a Harmonic terminal:
 
-```sh
+```bash
 export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build-harmonic${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
 gz sim -s -r --headless-rendering examples/harmonic/world.sdf
 ```
 
 Or, in a separate Jetty terminal:
 
-```sh
+```bash
 export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build-jetty${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
 gz sim -s -r --headless-rendering examples/jetty/world.sdf
 ```
@@ -183,21 +193,13 @@ Images must be `R8G8B8`. Unsupported formats are rejected, never reinterpreted a
 
 To choose a default remote destination, omit `udp_host` and set:
 
-```sh
+```bash
 export PX4_VIDEO_HOST_IP=192.168.1.100
 ```
 
-## Encoders, ownership, and lifecycle
-
-`use_cuda=true` attempts NVIDIA `nvh264enc`. If it is absent, cannot initialize, or later reports a fatal error, the affected stream falls back to x264. Other cameras retain their own encoder and pipeline states. Errors/EOS stop the pipeline and schedule a retry after one second; they do not terminate the simulator. NVENC-specific integration checks skip when the encoder or usable hardware is unavailable.
-
-RGB conversion to the encoder input format remains on the CPU. `use_cuda` does not make the renderer-to-appsrc path zero-copy.
-
-Rendering access occurs on Gazebo's rendering callbacks. `Camera::Copy()` fills an adapter-owned image; `StreamPipeline::SubmitFrame()` copies its bytes into a GStreamer-owned buffer before returning. A bounded pending slot retains the newest frame if the worker falls behind. The worker transfers that buffer to appsrc without another full-frame copy and never holds a Gazebo image pointer. Default appsrc timestamps use its running clock, retaining the original wall-clock behavior; simulation time controls the adapter's capture rate. Teardown disconnects callbacks, stops frame submissions, joins stream workers, and releases pipeline resources.
-
 ## View a stream
 
-```sh
+```bash
 gst-launch-1.0 -v \
   udpsrc port=5606 caps="application/x-rtp,media=video,encoding-name=H264,payload=96" \
   ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert \
@@ -206,48 +208,75 @@ gst-launch-1.0 -v \
 
 Use port `5604` in another receiver for the second example camera.
 
-## Testing
+## Encoding and recovery
 
-Core tests can be compiled and run without Gazebo:
+`use_cuda=true` attempts NVIDIA `nvh264enc`. If the encoder is absent, cannot
+initialize, or fails at runtime, that stream falls back to x264. Other cameras
+retain their own encoder and pipeline state.
 
-```sh
-cmake -S . -B build-core -DGST_PLANE_CAMERA_BUILD_PLUGIN=OFF
-cmake --build build-core -j"$(nproc)"
-ctest --test-dir build-core --output-on-failure
-```
-
-They check configuration/defaults, environment overrides, real GStreamer element settings, frame ownership and timestamps, retries after error/EOS, encoder fallback, multiple streams, and concurrent shutdown. No NVIDIA GPU is needed for the required tests.
-
-Enable rendering smoke tests in either configured backend build:
-
-```sh
-cmake -S . -B build-jetty -DGZ_DISTRO=jetty -DGST_PLANE_CAMERA_RUNTIME_TESTS=ON
-cmake --build build-jetty -j"$(nproc)"
-ctest --test-dir build-jetty --output-on-failure
-```
-
-For Harmonic, substitute `build-harmonic` and `-DGZ_DISTRO=harmonic`. Runtime smoke tests require actual camera frames reaching appsrc (`APP_SRC_FIRST_FRAME`), not just a successful load. They may report a skip when the renderer is unavailable; a skip is not a runtime pass.
-
-Exercise both streams, removal, rediscovery after respawn, rejection of a monochrome camera while the other stream continues, and clean shutdown:
-
-```sh
-python3 tests/integration/dynamic_cameras.py jetty build-jetty
-# Or in the Harmonic environment:
-python3 tests/integration/dynamic_cameras.py harmonic build-harmonic
-```
-
-CI uses isolated Ubuntu 24.04 jobs for Harmonic and Jetty, builds each adapter binary, runs core/linkage checks, and attempts rendering smoke tests. Compile-tested, runtime-smoke-tested, and manually flight-tested are distinct claims; see [validation evidence](docs/VALIDATION.md) for the evidence collected for this refactor and the [refactor report](docs/REFACTOR.md) for the full file layout and responsibility split.
+Fatal GStreamer errors and EOS stop the affected pipeline and schedule a retry
+after one second. RGB conversion to I420 for x264 or NV12 for NVENC runs on the
+CPU; `use_cuda` does not make the frame path zero-copy.
 
 ## Install
 
 Choose one distribution for a given prefix. For example:
 
-```sh
+```bash
 cmake --install build-jetty --prefix "$HOME/.local"
 export GZ_SIM_SYSTEM_PLUGIN_PATH="$HOME/.local/lib${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
 ```
 
 The default install directory follows CMake's normal library directory, usually `lib`; if your platform uses `lib64`, adjust the exported path or configure `-DCMAKE_INSTALL_LIBDIR=lib`. Installing a second distribution to the same prefix would overwrite the identically named binary. Use separate prefixes to retain both and expose only the matching prefix to Gazebo.
+
+## Testing
+
+The following results were verified locally on 2026-09-16. The CI badge shows
+the current workflow status; a skipped runtime test does not establish runtime
+compatibility.
+
+| Check | Harmonic | Jetty |
+| --- | --- | --- |
+| Compilation and correct library linkage | Passed | Passed |
+| Direct RGB camera frames reaching appsrc | Passed with a native server harness | Passed with `gz sim` |
+| Camera removal and respawn | Not runtime-tested | Passed |
+| Unsupported-format rejection while another camera streams | Not runtime-tested | Passed |
+| Hardware NVENC encoding | Not validated; optional test skipped | Not validated; optional test skipped |
+| Manual PX4 flight | Not tested | Not tested |
+
+Both distributions have runtime camera evidence; Harmonic's standard CLI launch
+and dynamic camera lifecycle remain unverified. The Harmonic harness used a
+relocated dependency tree, versioned Ogre2, and Bullet physics.
+
+Run the default checks in the matching environment:
+
+```bash
+ctest --test-dir build-jetty --output-on-failure
+# Or, in the Harmonic environment:
+ctest --test-dir build-harmonic --output-on-failure
+```
+
+The detailed tests cover configuration, environment overrides, real GStreamer
+element settings, buffer ownership, timestamps, packed RGB row strides, encoded
+RTP output, independent streams, error/EOS retries, fallback, and concurrent
+shutdown. See [TESTING.md](docs/TESTING.md) for the full coverage, core-only
+builds, rendering smoke tests, dynamic camera tests, and recorded limitations.
+
+## Architecture
+
+One Gazebo Sim adapter handles discovery, SDF parsing, simulation-time capture
+scheduling, and rendering callbacks for both distributions. Each camera has an
+independent simulator-neutral GStreamer pipeline.
+
+```text
+Gazebo rendering camera → Camera::Copy() → owned frame buffer
+    → appsrc → video conversion → H.264 encoder → RTP / UDP
+```
+
+The core copies image bytes into GStreamer-owned memory before returning from
+the rendering callback. Its worker never retains Gazebo camera pointers or
+borrowed image buffers. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the source
+layout, buffer ownership, and stream lifecycle.
 
 ## License
 
